@@ -1,0 +1,55 @@
+# Dependencies and build output
+/.venv*/
+/venv/
+node_modules/
+/target/
+/build/
+/dist/
+*.egg-info/
+
+# Caches and test output
+__pycache__/
+*.py[cod]
+.cache/
+.uv-cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local configuration, credentials and knowledge base data
+.env
+.env.*
+.envrc
+!/.env.example
+/config.yaml
+/config.yml
+/config.*.yaml
+/config.*.yml
+!/config.example.yaml
+/.secrets/
+/reranker/api-key
+*.key
+*.pem
+*.p12
+*.pfx
+/data/
+*.sqlite3
+*.sqlite3-*
+
+# Editors, operating systems and temporary files
+.idea/
+.vscode/
+.vs/
+*.iml
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*.tmp
+*.bak
+*.log
+*~

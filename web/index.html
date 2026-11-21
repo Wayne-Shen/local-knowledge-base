@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>本地知识库</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="shell topbar-inner">
+      <a class="brand" href="/">本地知识库</a>
+      <div class="topbar-actions">
+        <span class="connection" id="connection" role="status">连接中</span>
+        <button type="button" class="secondary" id="manage-folders" aria-haspopup="dialog">管理文件夹</button>
+      </div>
+    </div>
+  </header>
+  <main class="shell layout">
+    <section class="workspace" aria-labelledby="workspace-title">
+      <div class="query-panel">
+        <h1 id="workspace-title">搜索你的资料</h1>
+        <nav class="modes" aria-label="查询方式">
+          <button type="button" id="mode-search" aria-pressed="true">搜索</button>
+          <button type="button" id="mode-ask" aria-pressed="false">问答</button>
+        </nav>
+        <form id="query-form">
+          <label class="visually-hidden" id="query-label" for="query">搜索词</label>
+          <div class="search-box">
+            <textarea id="query" rows="2" maxlength="2000" placeholder="输入关键词或短语" required></textarea>
+            <button class="primary" id="submit" type="submit">搜索</button>
+          </div>
+          <div class="options">
+            <label id="keyword-option"><input type="checkbox" id="keyword"> 仅关键词</label>
+            <label id="cloud-option" hidden><input type="checkbox" id="cloud"> 使用 DeepSeek</label>
+          </div>
+        </form>
+      </div>
+      <p class="feedback" id="feedback" role="status" hidden></p>
+      <section id="output" aria-label="查询结果" aria-live="polite"></section>
+    </section>
+    <aside class="index-panel" aria-labelledby="index-title">
+      <div class="index-header">
+        <h2 id="index-title">索引状态</h2>
+        <button type="button" class="secondary" id="scan">立即扫描</button>
+      </div>
+      <dl class="stats">
+        <div><dt>归档文件</dt><dd id="file-count">—</dd></div>
+        <div><dt>可检索片段</dt><dd id="passage-count">—</dd></div>
+        <div><dt>已向量化</dt><dd id="vector-count">—</dd></div>
+      </dl>
+      <p id="last-scan" class="index-message"></p>
+      <div class="inbox" id="inbox" hidden>
+        <h3>投递目录</h3>
+        <p>将文件放入此文件夹，服务会自动归档并建立索引。</p>
+        <code id="inbox-path">—</code>
+      </div>
+      <details id="issues" hidden>
+        <summary id="issues-label">索引详情</summary>
+        <ul id="issues-list"></ul>
+      </details>
+    </aside>
+  </main>
+  <dialog class="folder-dialog" id="folder-dialog" aria-labelledby="folder-title">
+    <div class="folder-header">
+      <h2 id="folder-title">监控文件夹</h2>
+      <button type="button" class="secondary" id="close-folders">关闭</button>
+    </div>
+    <div class="folder-body">
+      <form id="folder-form">
+        <label for="folder-path">文件夹路径</label>
+        <div class="folder-entry">
+          <input id="folder-path" name="path" type="text" placeholder="例如 ~/Documents/资料" aria-describedby="folder-hint" autocomplete="off" spellcheck="false" required>
+          <button class="primary" id="add-folder" type="submit">添加</button>
+        </div>
+        <p id="folder-hint">输入本机文件夹的路径。监控包含子文件夹。</p>
+      </form>
+      <div class="folder-picker" id="folder-picker" hidden>
+        <button type="button" class="secondary" id="pick-folder" aria-describedby="picker-hint">在 Mac 上选择文件夹</button>
+        <p id="picker-hint" class="folder-hint">微信等应用的受保护目录，请在系统窗口中选中要监控的附件文件夹。</p>
+      </div>
+      <p id="folder-feedback" class="folder-feedback" role="status" hidden></p>
+      <ul class="folder-list" id="folder-list" aria-label="已监控的文件夹"></ul>
+      <p id="folder-empty" hidden>暂无监控文件夹。</p>
+      <p id="folder-removal-hint" class="folder-hint" hidden>移除后，已归档的文件仍可搜索。</p>
+    </div>
+  </dialog>
+</body>
+</html>

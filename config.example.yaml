@@ -1,0 +1,56 @@
+# Relative paths are resolved from this file. The default inbox is created under data_dir.
+data_dir: ./data
+port: 8765
+
+worker:
+  python:
+    macos: ./.venv/bin/python
+    windows: ./.venv/Scripts/python.exe
+    linux: ./.venv/bin/python
+  script: ./worker/worker.py
+  ocr_languages: [en-US, zh-Hans]
+  timeout_seconds: 180
+
+sources:
+  inbox:
+    preset: inbox
+    # paths:
+    #   all: ["/path/to/Inbox"]
+    allow_cloud: false
+  # wechat:
+  #   preset: wechat
+  #   allow_cloud: false
+  # feishu:
+  #   preset: feishu
+  #   paths:
+  #     macos: ["~/Downloads/Feishu"]
+  #     windows: ["~/Downloads/Feishu"]
+  #   allow_cloud: false
+  # notes:
+  #   paths:
+  #     all: ["~/Documents/Notes"]
+  #   include: ["**/*.md", "**/*.pdf"]
+  #   exclude: ["**/drafts/**"]
+  #   allow_cloud: false
+
+models:
+  primary:
+    url: http://127.0.0.1:11434
+    chat_model: qwen3:4b
+    context_tokens: 16384
+  fallback:
+    enabled: false
+    model: deepseek-flash
+    credential_account: default
+  annotate: false
+  # Optional llama-server running a reranker on loopback.
+  # reranker:
+  #   url: http://127.0.0.1:8766
+  #   api_key_file: ./.secrets/reranker-api-key
+
+schedule:
+  scan_seconds: 1800
+  settle_seconds: 3
+  embedding_seconds: 6
+  embedding_batch: 32
+  max_file_mib: 128
