@@ -49,6 +49,12 @@ enum Request<'a> {
     PdfRows {
         path: &'a Path,
     },
+    ImagePreview {
+        path: &'a Path,
+    },
+    DocumentPreview {
+        path: &'a Path,
+    },
     Embed {
         db: &'a Path,
         ollama: &'a str,
@@ -112,14 +118,25 @@ pub fn pdf_rows(config: &Config, path: &Path) -> Result<Vec<Section>> {
 }
 
 pub fn pdf_preview(config: &Config, path: &Path, page: u32) -> Result<Vec<u8>> {
-    let mut output = execute(config, Request::PdfPreview { path, page })?;
+    read_png(execute(config, Request::PdfPreview { path, page })?)
+}
+
+pub fn image_preview(config: &Config, path: &Path) -> Result<Vec<u8>> {
+    read_png(execute(config, Request::ImagePreview { path })?)
+}
+
+pub fn document_preview(config: &Config, path: &Path) -> Result<serde_json::Value> {
+    run(config, Request::DocumentPreview { path })
+}
+
+fn read_png(mut output: File) -> Result<Vec<u8>> {
     ensure!(
         output.metadata()?.len() <= 8 * 1024 * 1024,
-        "PDF preview exceeds the output limit"
+        "Preview exceeds the output limit"
     );
     let mut png = Vec::new();
     output.read_to_end(&mut png)?;
-    ensure!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "Invalid PDF preview");
+    ensure!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "Invalid PNG preview");
     Ok(png)
 }
 

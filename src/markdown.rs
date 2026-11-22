@@ -1,10 +1,25 @@
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, html};
 
 pub fn render(markdown: &str) -> String {
+    render_inner(markdown, false)
+}
+
+pub fn render_document(markdown: &str) -> String {
+    render_inner(markdown, true)
+}
+
+fn render_inner(markdown: &str, strip_comments: bool) -> String {
     let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
     let events = Parser::new_ext(markdown, options).filter_map(|event| match event {
-        // Model output may quote untrusted source text. Only the parser can create markup.
-        Event::Html(text) | Event::InlineHtml(text) => Some(Event::Text(text)),
+        // Model and document output may contain untrusted source text. Only the parser can create markup.
+        Event::Html(text) | Event::InlineHtml(text) => {
+            let trimmed = text.trim();
+            if strip_comments && trimmed.starts_with("<!--") && trimmed.ends_with("-->") {
+                None
+            } else {
+                Some(Event::Text(text))
+            }
+        }
         Event::Start(Tag::Link { .. } | Tag::Image { .. })
         | Event::End(TagEnd::Link | TagEnd::Image) => None,
         event => Some(event),
@@ -16,7 +31,7 @@ pub fn render(markdown: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::{render, render_document};
 
     #[test]
     fn renders_tables_and_keeps_citation_markers() {
@@ -38,5 +53,16 @@ mod tests {
         assert!(!html.contains("<a "));
         assert!(!html.contains("<img "));
         assert!(!html.contains("example.com"));
+    }
+
+    #[test]
+    fn document_render_strips_html_comments_but_still_escapes_markup() {
+        let html = render_document(
+            "<!-- Slide number: 1 -->\n\n# Quarterly Review\n\n<script>alert(1)</script>",
+        );
+        assert!(!html.contains("Slide number"));
+        assert!(html.contains("<h1>Quarterly Review</h1>"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("<script>"));
     }
 }

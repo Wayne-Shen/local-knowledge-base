@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="figma">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -14,6 +14,10 @@
       <a class="brand" href="/">本地知识库</a>
       <div class="topbar-actions">
         <span class="connection" id="connection" role="status">连接中</span>
+        <div class="theme-switch" role="group" aria-label="界面风格">
+          <button type="button" id="theme-figma" data-theme-option="figma" aria-pressed="true">Figma</button>
+          <button type="button" id="theme-miro" data-theme-option="miro" aria-pressed="false">Miro</button>
+        </div>
         <button type="button" class="secondary" id="manage-folders" aria-haspopup="dialog">管理文件夹</button>
       </div>
     </div>
@@ -25,6 +29,7 @@
         <nav class="modes" aria-label="查询方式">
           <button type="button" id="mode-search" aria-pressed="true">搜索</button>
           <button type="button" id="mode-ask" aria-pressed="false">问答</button>
+          <button type="button" id="mode-archive" aria-pressed="false">归档文档</button>
         </nav>
         <form id="query-form">
           <label class="visually-hidden" id="query-label" for="query">搜索词</label>
@@ -37,6 +42,15 @@
             <label id="cloud-option" hidden><input type="checkbox" id="cloud"> 使用 DeepSeek</label>
           </div>
         </form>
+        <div id="archive-controls" class="archive-controls" hidden>
+          <div class="archive-filter-bar">
+            <label class="visually-hidden" for="archive-filter">筛选归档文档</label>
+            <input id="archive-filter" type="search" placeholder="按文件名、扩展名、来源或标签筛选…" autocomplete="off" spellcheck="false">
+            <button type="button" class="secondary" id="archive-retry-failed" hidden>重试失败文件</button>
+            <button type="button" class="secondary" id="archive-refresh">刷新</button>
+          </div>
+          <div id="archive-types" class="archive-types" role="group" aria-label="按文件类型筛选"></div>
+        </div>
       </div>
       <p class="feedback" id="feedback" role="status" hidden></p>
       <section id="output" aria-label="查询结果" aria-live="polite"></section>
@@ -59,6 +73,9 @@
       </div>
       <details id="issues" hidden>
         <summary id="issues-label">索引详情</summary>
+        <div class="issues-actions" id="issues-actions" hidden>
+          <button type="button" class="secondary" id="retry-failed">重试失败文件</button>
+        </div>
         <ul id="issues-list"></ul>
       </details>
     </aside>

@@ -448,7 +448,7 @@ fn visible(data: &Path, root: &Path, path: &Path) -> bool {
     }))
 }
 
-fn is_supported(extension: &str) -> bool {
+pub(crate) fn is_supported(extension: &str) -> bool {
     matches!(
         extension,
         "txt"

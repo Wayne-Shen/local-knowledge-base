@@ -156,8 +156,61 @@ def run(directory, port):
             status = wait_for(base, lambda status: status["counts"]["embedded"] == expected_passages, process, trace)
             assert status["counts"]["files"] == expected and not status["errors"], status
             assert status["inbox"] == str(public) and status["data_dir"] == str(directory / "data"), status
+            assert status["theme"] == "figma", status
+            assert call(base, "/api/theme", {"theme": "miro"}) == {"theme": "miro"}
+            assert call(base, "/api/status")["theme"] == "miro"
+            try:
+                call(base, "/api/theme", {"theme": "invalid"})
+            except HTTPError as error:
+                assert error.code in (400, 422), error.code
+            else:
+                raise AssertionError("An unsupported UI theme was accepted")
+            try:
+                call(base, "/api/theme", {"theme": "figma"}, headers={"Origin": "https://elsewhere.invalid"})
+            except HTTPError as error:
+                assert error.code == 403
+            else:
+                raise AssertionError("A cross-origin request changed the UI theme")
             assert not (directory / "data" / "inbox").exists()
             assert len(list((directory / "data" / "archive").glob("*/*/*/*"))) == expected
+            archived = call(base, "/api/archive")["files"]
+            assert len(archived) == expected, archived
+            by_title = {item["title"]: item for item in archived}
+            obs = by_title.get("observatory.md") or by_title["replica.md"]
+            assert obs["extension"] == "md" and obs["origin_count"] == 2, obs
+            assert obs["sources"] == ["private", "public"] and obs["parsed"] is True, obs
+            assert obs["passages"] == 1 and obs["embedded"] == 1 and obs["size"] == len(ZEPHYR_NOTE.encode()), obs
+            assert by_title["slides.pptx"]["extension"] == "pptx"
+            assert by_title["table.pdf"]["extension"] == "pdf" and by_title["table.pdf"]["passages"] == 4
+            try:
+                call(base, "/api/retry", {"hash": "invalid"})
+            except HTTPError as error:
+                assert error.code == 400, error.code
+            else:
+                raise AssertionError("An invalid retry hash was accepted")
+            try:
+                call(base, "/api/retry", {"hash": "0" * 64})
+            except HTTPError as error:
+                assert error.code == 404, error.code
+            else:
+                raise AssertionError("An unknown retry hash was accepted")
+            try:
+                call(base, "/api/retry", {}, headers={"Origin": "https://elsewhere.invalid"})
+            except HTTPError as error:
+                assert error.code == 403, error.code
+            else:
+                raise AssertionError("A cross-origin request triggered retry")
+            with sqlite3.connect(directory / "data" / "metadata.sqlite3") as catalog:
+                catalog.execute(
+                    "INSERT INTO pdf_table_index(hash, error, retry_at) VALUES (?, ?, ?)",
+                    (obs["hash"], "Simulated failure", 9999999999),
+                )
+            failed_status = call(base, "/api/status")
+            assert failed_status["counts"]["failed"] == 1 and failed_status["errors"][0]["hash"] == obs["hash"], failed_status
+            retried = call(base, "/api/retry", {"hash": obs["hash"]})
+            assert retried == {"queued": "retry", "retried": 1, "hash": obs["hash"]}, retried
+            cleared_status = call(base, "/api/status")
+            assert cleared_status["counts"]["failed"] == 0 and not cleared_status["errors"], cleared_status
             print("Archive, SHA-256 deduplication, document parsing and embeddings passed", flush=True)
 
             def search(query, keyword_only=True):
@@ -168,7 +221,14 @@ def run(directory, port):
             for filename in ("observatory.md", "replica.md", "OBSERVATORY"):
                 assert search(filename)["hits"][0]["hash"] == original["hash"], filename
             assert search("中文分词")["hits"][0]["title"] == "中文.md"
-            assert search("Juniper")["hits"][0]["title"] == "slides.pptx"
+            pptx_hit = search("Juniper")["hits"][0]
+            assert pptx_hit["title"] == "slides.pptx"
+            pptx_preview = call(base, pptx_hit["document_preview_url"])
+            assert pptx_preview["kind"] == "slides" and pptx_preview["total_slides"] == 1, pptx_preview
+            assert "Juniper quarterly brief" in pptx_preview["slides"][0]["title"], pptx_preview
+            md_preview = call(base, original["document_preview_url"])
+            assert md_preview["kind"] == "markdown" and "<h1>Zephyr Observatory</h1>" in md_preview["html"], md_preview
+            assert "<h1>Zephyr Observatory</h1>" in (original.get("snippet_html") or ""), original
             assert search("ZzzIgnoredMarker")["hits"] == []
             semantic = search("observatory entrance secret", keyword_only=False)
             assert semantic["mode"] == "hybrid" and semantic["warning"] is None, semantic
@@ -232,6 +292,26 @@ def run(directory, port):
                 assert error.code == 403
             else:
                 raise AssertionError("The local API accepted a cross-origin request")
+            try:
+                call(base, "/api/open", {"hash": original["hash"]}, headers={"Origin": "https://elsewhere.invalid"})
+            except HTTPError as error:
+                assert error.code == 403
+            else:
+                raise AssertionError("The local API accepted a cross-origin open request")
+            try:
+                call(base, "/api/open", {"hash": "not-a-hash"})
+            except HTTPError as error:
+                assert error.code == 400
+            else:
+                raise AssertionError("An invalid hash was accepted by /api/open")
+            (extra / "hot.txt").unlink()
+            hot_hash = search("Hothatch")["hits"][0]["hash"]
+            try:
+                call(base, "/api/open", {"hash": hot_hash})
+            except HTTPError as error:
+                assert error.code == 404
+            else:
+                raise AssertionError("Missing original file should return 404 from /api/open")
             print("Native watching, hot reload, duplicate cloud policy and origin checks passed", flush=True)
             call(base, "/api/reindex", {})
             wait_for(base, lambda status: status["counts"]["embedded"] < expected_passages + 2, process, trace)
@@ -297,6 +377,7 @@ def run(directory, port):
                 (kept / "unavailable.md").write_text("UnrestoredBookmark sentinel", encoding="utf-8")
             process = subprocess.Popen([str(KB), "--config", str(config), "serve"], stdout=log, stderr=log)
             wait_for(base, lambda state: state["progress"]["last_scan"] is not None, process, trace)
+            assert call(base, "/api/status")["theme"] == "miro"
             assert str(kept) in folders() and str(extra) not in folders() and str(watched) not in folders()
             assert search("DoNotCollect")["hits"] == []
             if sys.platform == "darwin":
