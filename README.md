@@ -1,5 +1,7 @@
 # 本地知识库 · Local Knowledge Base
 
+> **English** · [中文说明](README-CN.md)
+
 A native Rust service that watches selected folders, archives originals by SHA‑256, and makes their contents searchable from the browser, command line, and MCP. SQLite stores the catalog, Tantivy with Jieba handles keyword search, and LanceDB stores local bge-m3 embeddings. Qwen3 generates answers with links to the supporting excerpts and archived originals.
 
 ## Set up a development checkout
@@ -50,7 +52,7 @@ ollama pull qwen3:4b
 
 Run `./target/release/kb serve` on macOS or Linux, or `.\target\release\kb.exe serve` on Windows. If port 8765 is in use, set another port in your local config and open the matching loopback address.
 
-Open the [local knowledge base](http://127.0.0.1:8765). With the example config, copy a file into `data/inbox/` and search for a phrase from it. Keyword search becomes available after extraction. Vector search becomes available as embedding batches finish. The Web interface shows both counts and processing errors. Model answers render as Markdown, including tables. PDF citations show the archived page on demand. Open **提取文本** to view detected tables, copy them as Markdown, or read the cited text.
+Open the [local knowledge base](http://127.0.0.1:8765). With the example config, copy a file into `data/inbox/` and search for a phrase from it. Keyword search becomes available after extraction. Vector search becomes available as embedding batches finish. The Web interface shows both counts and processing errors (with one-click retry for individual or all failed files), includes an **归档文档** tab to browse archived documents with their metadata organized by file type (click any filename to open the file directly from its original location, reveal its folder, or use **下载原文件** to download the archived copy), and includes a top-bar switcher between **Figma** and **Miro** styles (persisted in the local catalog). Model answers render as Markdown, including tables. PDF citations show the archived page on demand, and other file types (images, Word, Markdown, HTML/EPUB, Excel/CSV/TSV spreadsheets, PowerPoint decks, JSON, and plain text) render with dedicated in-browser previews and copyable Markdown tables across Search, Ask, and Archive views. Open **提取文本** to view detected tables, copy them as Markdown, or read the cited text.
 
 ### Local configuration and credentials
 

@@ -2,7 +2,7 @@ use crate::{
     Progress, Runtime,
     folder_picker::AuthorizedFolder,
     markdown, models, resolve_archive, search,
-    store::{Counts, ParseError, Store},
+    store::{ArchivedDocument, Counts, ParseError, Store},
     worker,
 };
 use anyhow::Result;
@@ -50,13 +50,19 @@ pub async fn run(runtime: Arc<Runtime>, listener: TcpListener) -> Result<()> {
             }),
         )
         .route("/api/status", get(status))
+        .route("/api/archive", get(list_archive))
+        .route("/api/open", post(open_original))
+        .route("/api/theme", post(change_theme))
         .route("/api/folders", get(list_folders).post(change_folder))
         .route("/api/folders/pick", post(pick_folder))
         .route("/api/search", post(search_passages))
         .route("/api/ask", post(ask))
         .route("/api/scan", post(scan))
+        .route("/api/retry", post(retry_failed))
         .route("/api/reindex", post(reindex))
         .route("/original/{hash}", get(original))
+        .route("/preview/{hash}/image", get(image_preview))
+        .route("/preview/{hash}/document", get(document_preview))
         .route("/preview/{hash}/{page}", get(pdf_preview))
         .route("/preview/{hash}/{page}/tables", get(pdf_tables))
         .layer(DefaultBodyLimit::max(8192))
@@ -348,6 +354,155 @@ async fn update_folders(
     .map_err(ApiError::worker)?
 }
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UiTheme {
+    Figma,
+    Miro,
+}
+
+impl UiTheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Figma => "figma",
+            Self::Miro => "miro",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThemeChange {
+    theme: UiTheme,
+}
+
+#[derive(Serialize)]
+struct ThemeResult {
+    theme: &'static str,
+}
+
+async fn change_theme(
+    State(runtime): State<Arc<Runtime>>,
+    Json(change): Json<ThemeChange>,
+) -> Result<Json<ThemeResult>, ApiError> {
+    let theme = change.theme.as_str();
+    run_blocking(move || {
+        let config = runtime.config();
+        let store = Store::open(&config.data)?;
+        store.set_ui_theme(theme)?;
+        Ok(ThemeResult { theme })
+    })
+    .await
+    .map(Json)
+}
+
+#[derive(Serialize)]
+struct ArchiveList {
+    files: Vec<ArchivedDocument>,
+}
+
+async fn list_archive(State(runtime): State<Arc<Runtime>>) -> Result<Json<ArchiveList>, ApiError> {
+    run_blocking(move || {
+        let config = runtime.config();
+        let store = Store::open(&config.data)?;
+        Ok(ArchiveList {
+            files: store.archived_files()?,
+        })
+    })
+    .await
+    .map(Json)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenRequest {
+    hash: String,
+    #[serde(default)]
+    reveal: bool,
+}
+
+#[derive(Serialize)]
+struct OpenResult {
+    opened: &'static str,
+    path: String,
+}
+
+async fn open_original(
+    State(runtime): State<Arc<Runtime>>,
+    Json(request): Json<OpenRequest>,
+) -> Result<Json<OpenResult>, ApiError> {
+    if request.hash.len() != 64
+        || !request
+            .hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Invalid file hash"));
+    }
+    let hash = request.hash;
+    let reveal = request.reveal;
+    let target = run_blocking(move || {
+        let config = runtime.config();
+        let store = Store::open(&config.data)?;
+        store.resolve_existing_origin(&config.data, &hash)
+    })
+    .await?
+    .ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "原文件已不存在或无法访问，请点击“下载原文件”获取归档副本。",
+        )
+    })?;
+    let launch_target = target.clone();
+    run_blocking(move || launch_local_file(&launch_target, reveal)).await?;
+    Ok(Json(OpenResult {
+        opened: if reveal { "reveal" } else { "file" },
+        path: target.display().to_string(),
+    }))
+}
+
+fn launch_local_file(path: &std::path::Path, reveal: bool) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let output = {
+        let mut command = std::process::Command::new("/usr/bin/open");
+        if reveal {
+            command.arg("-R");
+        }
+        command.arg("--").arg(path).output()?
+    };
+    #[cfg(target_os = "windows")]
+    let output = {
+        let mut command = std::process::Command::new("explorer.exe");
+        if reveal {
+            let mut arg = std::ffi::OsString::from("/select,");
+            arg.push(path);
+            command.arg(arg);
+        } else {
+            command.arg(path);
+        }
+        command.output()?
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let output = {
+        let target = if reveal {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        std::process::Command::new("xdg-open")
+            .arg(target)
+            .output()?
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if stderr.is_empty() {
+            anyhow::bail!("无法使用系统默认应用打开原文件。");
+        }
+        anyhow::bail!("无法打开原文件：{stderr}");
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct Status {
     counts: Counts,
@@ -358,6 +513,7 @@ struct Status {
     sources: Vec<String>,
     cloud_enabled: bool,
     folder_picker: bool,
+    theme: String,
 }
 
 async fn status(State(runtime): State<Arc<Runtime>>) -> Result<Json<Status>, ApiError> {
@@ -377,6 +533,7 @@ async fn status(State(runtime): State<Arc<Runtime>>) -> Result<Json<Status>, Api
             cloud_enabled: config.models.fallback.enabled
                 && config.sources.values().any(|source| source.allow_cloud),
             folder_picker: runtime.folder_access.picker_available,
+            theme: store.ui_theme()?,
         })
     })
     .await
@@ -450,6 +607,54 @@ async fn scan(
     (StatusCode::ACCEPTED, Json(json!({"queued": "scan"})))
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetryRequest {
+    hash: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RetryResult {
+    queued: &'static str,
+    retried: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hash: Option<String>,
+}
+
+async fn retry_failed(
+    State(runtime): State<Arc<Runtime>>,
+    Json(request): Json<RetryRequest>,
+) -> Result<(StatusCode, Json<RetryResult>), ApiError> {
+    if let Some(hash) = &request.hash
+        && (hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Invalid file hash"));
+    }
+    let state = runtime.clone();
+    let target = request.hash.clone();
+    let retried = run_blocking(move || {
+        let config = state.config();
+        let store = Store::open(&config.data)?;
+        store.retry_failed(target.as_deref())
+    })
+    .await?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Archived file not found"))?;
+    if request.hash.is_none() {
+        runtime.retry_requested.store(true, Ordering::Relaxed);
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RetryResult {
+            queued: "retry",
+            retried,
+            hash: request.hash,
+        }),
+    ))
+}
+
 async fn reindex(
     State(runtime): State<Arc<Runtime>>,
     Json(_): Json<Value>,
@@ -483,6 +688,100 @@ async fn pdf_tables(
     with_pdf_page(runtime, hash, page, worker::pdf_tables)
         .await
         .map(Json)
+}
+
+async fn image_preview(
+    State(runtime): State<Arc<Runtime>>,
+    Path(hash): Path<String>,
+) -> Result<Response, ApiError> {
+    let permit =
+        runtime.requests.clone().try_acquire_owned().map_err(|_| {
+            ApiError::new(StatusCode::TOO_MANY_REQUESTS, "The knowledge base is busy")
+        })?;
+    let png = run_blocking(move || {
+        let _permit = permit;
+        let config = runtime.config();
+        let record = resolve_archive(&config.data, &hash)?;
+        record
+            .filter(|(path, _)| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .is_some_and(|ext| crate::store::is_image_extension(&ext))
+            })
+            .map(|(path, _)| worker::image_preview(&config, &path))
+            .transpose()
+    })
+    .await?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Image not found"))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (
+                header::HeaderName::from_static("cross-origin-resource-policy"),
+                "same-origin",
+            ),
+        ],
+        png,
+    )
+        .into_response())
+}
+
+async fn document_preview(
+    State(runtime): State<Arc<Runtime>>,
+    Path(hash): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let permit =
+        runtime.requests.clone().try_acquire_owned().map_err(|_| {
+            ApiError::new(StatusCode::TOO_MANY_REQUESTS, "The knowledge base is busy")
+        })?;
+    let payload = run_blocking(move || {
+        let _permit = permit;
+        let config = runtime.config();
+        let Some((path, title)) = resolve_archive(&config.data, &hash)? else {
+            return Ok(None);
+        };
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if extension == "pdf" {
+            return Ok(None);
+        }
+        if crate::store::is_image_extension(&extension) {
+            let store = Store::open(&config.data)?;
+            let passages: Vec<Value> = store
+                .document_passages(&hash, 20)?
+                .into_iter()
+                .map(|(locator, text)| json!({"locator": locator, "text": text}))
+                .collect();
+            return Ok(Some(json!({
+                "kind": "image",
+                "title": title,
+                "extension": extension,
+                "image_url": format!("/preview/{hash}/image"),
+                "passages": passages,
+                "truncated": false,
+            })));
+        }
+        let mut preview = worker::document_preview(&config, &path)?;
+        if let Some(object) = preview.as_object_mut() {
+            object.insert("title".into(), json!(title));
+            object.insert("extension".into(), json!(extension));
+            if object.get("kind").and_then(Value::as_str) == Some("markdown") {
+                let raw = object
+                    .remove("markdown")
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                object.insert("html".into(), json!(markdown::render_document(&raw)));
+            }
+        }
+        Ok(Some(preview))
+    })
+    .await?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Document preview not found"))?;
+    Ok(Json(payload))
 }
 
 async fn with_pdf_page<T: Send + 'static>(

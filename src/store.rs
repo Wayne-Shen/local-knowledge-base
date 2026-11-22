@@ -103,11 +103,18 @@ pub struct Hit {
     pub id: i64,
     pub hash: String,
     pub title: String,
+    pub extension: String,
     pub source: String,
     pub locator: String,
     pub snippet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet_html: Option<String>,
     pub original_url: String,
     pub page_preview_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_preview_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document_preview_url: Option<String>,
     pub summary: Option<String>,
     pub tags: Vec<String>,
 }
@@ -123,8 +130,29 @@ pub struct Counts {
 
 #[derive(Serialize)]
 pub struct ParseError {
+    pub hash: String,
     pub title: String,
     pub message: String,
+}
+
+#[derive(Serialize)]
+pub struct ArchivedDocument {
+    pub hash: String,
+    pub title: String,
+    pub extension: String,
+    pub source: String,
+    pub sources: Vec<String>,
+    pub source_labels: Vec<String>,
+    pub origin_count: i64,
+    pub size: i64,
+    pub archived_at: i64,
+    pub parsed: bool,
+    pub parse_error: Option<String>,
+    pub passages: i64,
+    pub embedded: i64,
+    pub summary: Option<String>,
+    pub tags: Vec<String>,
+    pub original_url: String,
 }
 
 pub struct IndexJob {
@@ -207,6 +235,48 @@ impl Store {
             )
             .optional()?;
         Ok(record.map(|(path, title)| (PathBuf::from(path), title)))
+    }
+
+    pub fn resolve_existing_origin(&self, data: &Path, hash: &str) -> Result<Option<PathBuf>> {
+        let mut statement = self.db.prepare(
+            "SELECT root, path FROM origins WHERE hash = ?1 ORDER BY source, root, path",
+        )?;
+        let rows = statement.query_map([hash], |row| {
+            Ok((
+                PathBuf::from(row.get::<_, String>(0)?),
+                PathBuf::from(row.get::<_, String>(1)?),
+            ))
+        })?;
+        let actual_data = data.canonicalize()?;
+        let actual_inbox = actual_data.join("inbox");
+        for row in rows {
+            let (root, path) = row?;
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let (Ok(canonical), Ok(actual_root)) = (path.canonicalize(), root.canonicalize())
+            else {
+                continue;
+            };
+            if canonical.strip_prefix(&actual_root).ok() != path.strip_prefix(&root).ok() {
+                continue;
+            }
+            if canonical.starts_with(&actual_data) && !canonical.starts_with(&actual_inbox) {
+                continue;
+            }
+            let supported = canonical
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(str::to_ascii_lowercase)
+                .is_some_and(|ext| crate::collector::is_supported(&ext));
+            if supported {
+                return Ok(Some(canonical));
+            }
+        }
+        Ok(None)
     }
 
     pub fn unchanged(&self, origin: &Origin<'_>) -> Result<bool> {
@@ -295,13 +365,59 @@ impl Store {
     }
 
     pub fn retry_errors(&self) -> Result<()> {
-        self.db
-            .execute("UPDATE files SET parse_retry_at = 0 WHERE parsed = 0", [])?;
-        self.db.execute(
-            "UPDATE pdf_table_index SET retry_at = 0 WHERE error IS NOT NULL",
-            [],
-        )?;
+        self.retry_failed(None)?;
         Ok(())
+    }
+
+    pub fn retry_failed(&self, hash: Option<&str>) -> Result<Option<usize>> {
+        let tx = self.db.unchecked_transaction()?;
+        let retried = if let Some(hash) = hash {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM files WHERE hash = ?1)",
+                [hash],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(None);
+            }
+            let file_changes = tx.execute(
+                "UPDATE files SET parse_error = NULL, parse_retry_at = 0
+                 WHERE hash = ?1 AND (parsed = 0 OR parse_error IS NOT NULL)",
+                [hash],
+            )?;
+            let table_changes = tx.execute(
+                "DELETE FROM pdf_table_index WHERE hash = ?1 AND error IS NOT NULL",
+                [hash],
+            )?;
+            tx.execute(
+                "UPDATE files SET annotation_retry_at = 0
+                 WHERE hash = ?1 AND parsed = 1 AND summary IS NULL AND annotation_retry_at != 0",
+                [hash],
+            )?;
+            usize::from(file_changes > 0 || table_changes > 0)
+        } else {
+            let count: i64 = tx.query_row(
+                "SELECT count(*) FROM files f
+                 LEFT JOIN pdf_table_index t ON t.hash = f.hash
+                 WHERE f.parsed = 0 OR f.parse_error IS NOT NULL OR t.error IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "UPDATE files SET parse_error = NULL, parse_retry_at = 0
+                 WHERE parsed = 0 OR parse_error IS NOT NULL",
+                [],
+            )?;
+            tx.execute("DELETE FROM pdf_table_index WHERE error IS NOT NULL", [])?;
+            tx.execute(
+                "UPDATE files SET annotation_retry_at = 0
+                 WHERE parsed = 1 AND summary IS NULL AND annotation_retry_at != 0",
+                [],
+            )?;
+            count.max(0) as usize
+        };
+        tx.commit()?;
+        Ok(Some(retried))
     }
 
     pub fn pdf_table_jobs(&self, limit: usize) -> Result<Vec<(String, PathBuf)>> {
@@ -470,6 +586,33 @@ impl Store {
         Ok(())
     }
 
+    pub fn ui_theme(&self) -> Result<String> {
+        let theme: Option<String> = self
+            .db
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'ui_theme'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match theme.as_deref() {
+            Some("miro") => "miro".to_owned(),
+            _ => "figma".to_owned(),
+        })
+    }
+
+    pub fn set_ui_theme(&self, theme: &str) -> Result<()> {
+        ensure!(
+            matches!(theme, "figma" | "miro"),
+            "Unsupported UI theme: {theme}"
+        );
+        self.db.execute(
+            "REPLACE INTO settings(key, value) VALUES ('ui_theme', ?1)",
+            [theme],
+        )?;
+        Ok(())
+    }
+
     pub fn has_vectors(&self) -> Result<bool> {
         Ok(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM chunks WHERE embedded = 1)",
@@ -489,24 +632,43 @@ impl Store {
                     let hash: String = row.get(0)?;
                     let tags: Option<String> = row.get(6)?;
                     let locator: String = row.get(3)?;
+                    let snippet: String = row.get(4)?;
                     let archive: String = row.get(7)?;
-                    let page_preview_url = Path::new(&archive)
+                    let extension = Path::new(&archive)
                         .extension()
-                        .filter(|extension| extension.eq_ignore_ascii_case("pdf"))
-                        .and(locator.strip_prefix("Page "))
-                        .and_then(|locator| locator.split(',').next())
-                        .and_then(|number| number.parse::<u32>().ok())
-                        .filter(|number| *number > 0)
-                        .map(|page| format!("/preview/{hash}/{page}"));
+                        .and_then(|extension| extension.to_str())
+                        .map(str::to_ascii_lowercase)
+                        .unwrap_or_default();
+                    let page_preview_url = (extension == "pdf")
+                        .then(|| {
+                            locator
+                                .strip_prefix("Page ")
+                                .and_then(|locator| locator.split(',').next())
+                                .and_then(|number| number.parse::<u32>().ok())
+                                .filter(|number| *number > 0)
+                                .map(|page| format!("/preview/{hash}/{page}"))
+                        })
+                        .flatten();
+                    let image_preview_url =
+                        is_image_extension(&extension).then(|| format!("/preview/{hash}/image"));
+                    let document_preview_url = (extension != "pdf"
+                        && !is_image_extension(&extension))
+                    .then(|| format!("/preview/{hash}/document"));
+                    let snippet_html = is_markdown_extension(&extension)
+                        .then(|| crate::markdown::render_document(&snippet));
                     Ok(Hit {
                         id,
                         original_url: format!("/original/{hash}"),
                         page_preview_url,
+                        image_preview_url,
+                        document_preview_url,
                         hash,
                         title: row.get(1)?,
+                        extension,
                         source: row.get(2)?,
                         locator,
-                        snippet: row.get(4)?,
+                        snippet,
+                        snippet_html,
                         summary: row.get(5)?,
                         tags: tags
                             .and_then(|value| serde_json::from_str(&value).ok())
@@ -516,6 +678,16 @@ impl Store {
             )
             .optional()?;
         Ok(row)
+    }
+
+    pub fn document_passages(&self, hash: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        let mut statement = self.db.prepare(
+            "SELECT locator, text FROM chunks WHERE hash = ?1 ORDER BY ordinal LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![hash, limit], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn annotation_job(&self) -> Result<Option<Vec<Hit>>> {
@@ -602,8 +774,9 @@ impl Store {
 
     pub fn counts(&self) -> Result<Counts> {
         let (files, parsed, failed) = self.db.query_row(
-            "SELECT count(*), count(*) FILTER (WHERE parsed = 1),
-                    count(*) FILTER (WHERE parse_error IS NOT NULL) FROM files",
+            "SELECT count(*), count(*) FILTER (WHERE f.parsed = 1),
+                    count(*) FILTER (WHERE f.parse_error IS NOT NULL OR t.error IS NOT NULL)
+             FROM files f LEFT JOIN pdf_table_index t ON t.hash = f.hash",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
@@ -623,21 +796,113 @@ impl Store {
 
     pub fn errors(&self) -> Result<Vec<ParseError>> {
         let mut statement = self.db.prepare(
-            "SELECT title, message FROM (
-                SELECT title, parse_error AS message, parse_retry_at AS retry_at
+            "SELECT hash, title, message FROM (
+                SELECT hash, title, parse_error AS message, parse_retry_at AS retry_at
                     FROM files WHERE parse_error IS NOT NULL
                 UNION ALL
-                SELECT f.title, 'PDF table indexing: ' || t.error, t.retry_at
+                SELECT f.hash, f.title, 'PDF table indexing: ' || t.error, t.retry_at
                     FROM pdf_table_index t JOIN files f ON f.hash = t.hash WHERE t.error IS NOT NULL
              ) ORDER BY retry_at DESC LIMIT 8",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(ParseError {
-                title: row.get(0)?,
-                message: row.get(1)?,
+                hash: row.get(0)?,
+                title: row.get(1)?,
+                message: row.get(2)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn archived_files(&self) -> Result<Vec<ArchivedDocument>> {
+        let mut statement = self.db.prepare(
+            "SELECT
+                f.hash,
+                f.archive,
+                f.title,
+                f.source,
+                f.size,
+                f.archived_at,
+                f.parsed,
+                coalesce(
+                    f.parse_error,
+                    CASE WHEN t.error IS NOT NULL THEN 'PDF table indexing: ' || t.error END
+                ),
+                f.summary,
+                f.tags,
+                coalesce(c.passages, 0),
+                coalesce(c.embedded, 0),
+                coalesce(o.origin_count, 0)
+             FROM files f
+             LEFT JOIN pdf_table_index t ON t.hash = f.hash
+             LEFT JOIN (
+                SELECT hash, count(*) AS passages,
+                       count(*) FILTER (WHERE embedded = 1) AS embedded
+                FROM chunks
+                GROUP BY hash
+             ) c ON c.hash = f.hash
+             LEFT JOIN (
+                SELECT hash, count(*) AS origin_count
+                FROM origins
+                GROUP BY hash
+             ) o ON o.hash = f.hash
+             ORDER BY f.archived_at DESC, f.title COLLATE NOCASE ASC",
+        )?;
+        let mut origin_stmt = self
+            .db
+            .prepare("SELECT DISTINCT source, root FROM origins WHERE hash = ?1")?;
+        let mut files = Vec::new();
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let hash: String = row.get(0)?;
+            let archive: String = row.get(1)?;
+            let title: String = row.get(2)?;
+            let source: String = row.get(3)?;
+            let parsed: i64 = row.get(6)?;
+            let tags: Option<String> = row.get(9)?;
+            let mut sources = std::collections::BTreeSet::new();
+            let mut source_labels = std::collections::BTreeSet::new();
+            let origin_rows = origin_stmt.query_map([&hash], |origin| {
+                Ok((origin.get::<_, String>(0)?, origin.get::<_, String>(1)?))
+            })?;
+            for origin in origin_rows {
+                let (origin_source, origin_root) = origin?;
+                let label = source_display_label(&origin_source, Some(&origin_root));
+                sources.insert(origin_source);
+                source_labels.insert(label);
+            }
+            if sources.is_empty() {
+                source_labels.insert(source_display_label(&source, None));
+                sources.insert(source.clone());
+            }
+            let extension = Path::new(&archive)
+                .extension()
+                .or_else(|| Path::new(&title).extension())
+                .and_then(|ext| ext.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            files.push(ArchivedDocument {
+                original_url: format!("/original/{hash}"),
+                hash,
+                title,
+                extension,
+                source,
+                sources: sources.into_iter().collect(),
+                source_labels: source_labels.into_iter().collect(),
+                origin_count: row.get(12)?,
+                size: row.get(4)?,
+                archived_at: row.get(5)?,
+                parsed: parsed != 0,
+                parse_error: row.get(7)?,
+                passages: row.get(10)?,
+                embedded: row.get(11)?,
+                summary: row.get(8)?,
+                tags: tags
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(files)
     }
 
     pub fn print_audit(&self, limit: usize) -> Result<()> {
@@ -668,9 +933,40 @@ impl Store {
     }
 }
 
+pub fn is_image_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "jpg" | "jpeg" | "png" | "tiff" | "tif" | "bmp" | "gif" | "heic" | "webp"
+    )
+}
+
+fn is_markdown_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "md" | "markdown" | "docx" | "pptx" | "xlsx" | "xls" | "html" | "htm" | "epub"
+    )
+}
+
 pub fn path_string(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| anyhow::anyhow!("Filename must use Unicode: {}", path.display()))
+}
+
+fn source_display_label(source: &str, root: Option<&str>) -> String {
+    if let Some(digest) = source.strip_prefix("folder-")
+        && digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        if let Some(name) = root
+            .and_then(|path| Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+        {
+            return name.to_owned();
+        }
+        return format!("folder-{}", &digest[..8]);
+    }
+    source.to_owned()
 }
 
 fn passages(section: Section) -> Vec<(String, String)> {
@@ -718,4 +1014,178 @@ fn passages(section: Section) -> Vec<(String, String)> {
         start = end - OVERLAP;
     }
     passages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Archive, Origin, Store};
+    use crate::worker::Section;
+    use anyhow::Result;
+    use std::path::Path;
+
+    #[test]
+    fn stores_and_validates_ui_theme() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = Store::open(directory.path())?;
+        store.initialize()?;
+        assert_eq!(store.ui_theme()?, "figma");
+        store.set_ui_theme("miro")?;
+        assert_eq!(store.ui_theme()?, "miro");
+        store.set_ui_theme("figma")?;
+        assert_eq!(store.ui_theme()?, "figma");
+        assert!(store.set_ui_theme("unknown").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn lists_archived_files_with_metadata_and_counts() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        store.initialize()?;
+        let hash = "a".repeat(64);
+        let archive = Archive {
+            hash: &hash,
+            relative: Path::new("inbox/2026/11/sample.pdf"),
+            title: "Sample Report.pdf",
+            source: "inbox",
+            size: 2048,
+        };
+        store.record(
+            &archive,
+            &Origin {
+                source: "inbox",
+                root: Path::new("/tmp/inbox"),
+                path: Path::new("/tmp/inbox/Sample Report.pdf"),
+                fingerprint: "1:2048",
+            },
+        )?;
+        let folder_source = format!("folder-{}", "b".repeat(64));
+        store.record(
+            &archive,
+            &Origin {
+                source: &folder_source,
+                root: Path::new("/tmp/WeChatFiles"),
+                path: Path::new("/tmp/WeChatFiles/Copy.pdf"),
+                fingerprint: "2:2048",
+            },
+        )?;
+        store.parsed(
+            &hash,
+            vec![Section {
+                locator: "Page 1".into(),
+                text: "Hello archive metadata.".into(),
+            }],
+        )?;
+        store.mark_embedded([1])?;
+        store.store_annotation(&hash, "Short summary", &["finance".into(), "q4".into()])?;
+
+        let files = store.archived_files()?;
+        assert_eq!(files.len(), 1);
+        let doc = &files[0];
+        assert_eq!(doc.title, "Sample Report.pdf");
+        assert_eq!(doc.extension, "pdf");
+        assert_eq!(doc.size, 2048);
+        assert_eq!(doc.origin_count, 2);
+        assert_eq!(doc.sources, vec![folder_source, "inbox".into()]);
+        assert_eq!(doc.source_labels, vec!["WeChatFiles", "inbox"]);
+        assert!(doc.parsed);
+        assert_eq!(doc.passages, 1);
+        assert_eq!(doc.embedded, 1);
+        assert_eq!(doc.summary.as_deref(), Some("Short summary"));
+        assert_eq!(doc.tags, vec!["finance", "q4"]);
+        assert_eq!(doc.original_url, format!("/original/{hash}"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_existing_origin_and_skips_missing_or_unsupported_files() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let data = directory.path().join("data");
+        let docs = directory.path().join("docs");
+        std::fs::create_dir_all(&data)?;
+        std::fs::create_dir_all(&docs)?;
+        let mut store = Store::open(&data)?;
+        store.initialize()?;
+
+        let hash = "c".repeat(64);
+        let missing = docs.join("missing.md");
+        let existing = docs.join("present.md");
+        std::fs::write(&existing, "hello")?;
+        let archive = Archive {
+            hash: &hash,
+            relative: Path::new("docs/2026/11/present.md"),
+            title: "present.md",
+            source: "docs",
+            size: 5,
+        };
+        store.record(
+            &archive,
+            &Origin {
+                source: "a_missing",
+                root: &docs,
+                path: &missing,
+                fingerprint: "1:5",
+            },
+        )?;
+        store.record(
+            &archive,
+            &Origin {
+                source: "b_present",
+                root: &docs,
+                path: &existing,
+                fingerprint: "2:5",
+            },
+        )?;
+        assert_eq!(
+            store.resolve_existing_origin(&data, &hash)?,
+            Some(existing.canonicalize()?)
+        );
+
+        std::fs::remove_file(&existing)?;
+        assert_eq!(store.resolve_existing_origin(&data, &hash)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn retries_single_and_all_failed_files() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path())?;
+        store.initialize()?;
+        let first = "1".repeat(64);
+        let second = "2".repeat(64);
+        for (hash, title) in [(&first, "first.pdf"), (&second, "second.pdf")] {
+            store.record(
+                &Archive {
+                    hash,
+                    relative: Path::new(title),
+                    title,
+                    source: "inbox",
+                    size: 512,
+                },
+                &Origin {
+                    source: "inbox",
+                    root: Path::new("/tmp/inbox"),
+                    path: &Path::new("/tmp/inbox").join(title),
+                    fingerprint: "1:512",
+                },
+            )?;
+            store.parse_failed(hash, "Encrypted PDF requires a decrypted copy")?;
+        }
+        assert_eq!(store.counts()?.failed, 2);
+        assert!(store.parse_jobs(4)?.is_empty());
+        assert_eq!(store.retry_failed(Some(&"9".repeat(64)))?, None);
+
+        assert_eq!(store.retry_failed(Some(&first))?, Some(1));
+        assert_eq!(store.counts()?.failed, 1);
+        let jobs = store.parse_jobs(4)?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].0, first);
+
+        store.parse_failed(&first, "Still failing")?;
+        assert_eq!(store.counts()?.failed, 2);
+        assert_eq!(store.retry_failed(None)?, Some(2));
+        assert_eq!(store.counts()?.failed, 0);
+        assert_eq!(store.parse_jobs(4)?.len(), 2);
+        Ok(())
+    }
 }

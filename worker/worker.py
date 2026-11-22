@@ -15,6 +15,11 @@ from ipaddress import ip_address
 TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".log", ".rst"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".gif", ".heic", ".webp"}
 MAX_TEXT_CHARS = 4_000_000
+MAX_PREVIEW_CHARS = 80_000
+MAX_PREVIEW_ROWS = 200
+MAX_PREVIEW_COLS = 40
+MAX_PREVIEW_SHEETS = 12
+MAX_PREVIEW_SLIDES = 40
 MODEL = "bge-m3:latest"
 VECTOR_DIMENSIONS = 1024
 TABLE = "chunks"
@@ -291,6 +296,227 @@ def parse(request):
     return sections
 
 
+def image_preview(request):
+    import io
+    from PIL import Image, ImageOps
+
+    path = Path(request["path"])
+    try:
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image)
+            image.thumbnail((1600, 1600))
+            if image.mode not in ("RGB", "RGBA"):
+                image = image.convert("RGB")
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG", optimize=True)
+            return buffer.getvalue()
+    except Exception:
+        if sys.platform != "darwin":
+            raise
+        with tempfile.TemporaryDirectory(prefix="kb-img-") as directory:
+            output = Path(directory) / "preview.png"
+            result = subprocess.run(
+                ["/usr/bin/sips", "-s", "format", "png", "-Z", "1600", str(path), "--out", str(output)],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if result.returncode != 0 or not output.is_file():
+                raise RuntimeError(result.stderr.decode("utf-8", errors="replace").strip() or "Image preview failed")
+            return output.read_bytes()
+
+
+def normalize_sheet(name, raw_rows):
+    non_empty = []
+    for row in raw_rows:
+        values = ["" if cell is None else str(cell).strip() for cell in row[:MAX_PREVIEW_COLS]]
+        while values and not values[-1]:
+            values.pop()
+        if any(values):
+            non_empty.append(values)
+    if not non_empty:
+        return None
+    width = min(MAX_PREVIEW_COLS, max(len(row) for row in non_empty[: MAX_PREVIEW_ROWS + 1]))
+    padded = [row[:width] + [""] * max(0, width - len(row)) for row in non_empty]
+    header = padded[0]
+    body = padded[1:]
+    truncated = len(body) > MAX_PREVIEW_ROWS or any(len(row) > MAX_PREVIEW_COLS for row in raw_rows)
+    return {
+        "name": name,
+        "header": [cell or f"列 {index + 1}" for index, cell in enumerate(header)],
+        "rows": body[:MAX_PREVIEW_ROWS],
+        "total_rows": len(body),
+        "truncated": truncated,
+    }
+
+
+def spreadsheet_preview(path, extension):
+    import csv
+    import io
+
+    sheets = []
+    truncated = False
+    if extension in {".csv", ".tsv"}:
+        delimiter = "\t" if extension == ".tsv" else ","
+        text = read_text(path)
+        reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+        raw_rows = []
+        for index, row in enumerate(reader):
+            raw_rows.append(row)
+            if index >= MAX_PREVIEW_ROWS + 50:
+                truncated = True
+                break
+        sheet = normalize_sheet(path.name, raw_rows)
+        if sheet:
+            sheet["truncated"] = sheet["truncated"] or truncated
+            sheets.append(sheet)
+    elif extension == ".xlsx":
+        import openpyxl
+
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            names = workbook.sheetnames
+            if len(names) > MAX_PREVIEW_SHEETS:
+                truncated = True
+            for name in names[:MAX_PREVIEW_SHEETS]:
+                worksheet = workbook[name]
+                raw_rows = []
+                for index, row in enumerate(worksheet.iter_rows(values_only=True)):
+                    raw_rows.append(list(row))
+                    if index >= MAX_PREVIEW_ROWS + 50:
+                        truncated = True
+                        break
+                sheet = normalize_sheet(name, raw_rows)
+                if sheet:
+                    sheet["truncated"] = sheet["truncated"] or truncated
+                    sheets.append(sheet)
+        finally:
+            workbook.close()
+    elif extension == ".xls":
+        import xlrd
+
+        workbook = xlrd.open_workbook(str(path))
+        if workbook.nsheets > MAX_PREVIEW_SHEETS:
+            truncated = True
+        for index in range(min(workbook.nsheets, MAX_PREVIEW_SHEETS)):
+            worksheet = workbook.sheet_by_index(index)
+            limit = min(worksheet.nrows, MAX_PREVIEW_ROWS + 50)
+            raw_rows = [
+                [worksheet.cell_value(row_index, col_index) for col_index in range(min(worksheet.ncols, MAX_PREVIEW_COLS))]
+                for row_index in range(limit)
+            ]
+            sheet_truncated = worksheet.nrows > MAX_PREVIEW_ROWS or worksheet.ncols > MAX_PREVIEW_COLS
+            sheet = normalize_sheet(worksheet.name, raw_rows)
+            if sheet:
+                sheet["truncated"] = sheet["truncated"] or sheet_truncated
+                sheets.append(sheet)
+    return {
+        "kind": "spreadsheet",
+        "sheets": sheets,
+        "truncated": truncated or any(sheet["truncated"] for sheet in sheets),
+    }
+
+
+def slides_preview(path):
+    from pptx import Presentation
+
+    presentation = Presentation(str(path))
+    all_slides = list(presentation.slides)
+    total_slides = len(all_slides)
+    slides = []
+    for index, slide in enumerate(all_slides[:MAX_PREVIEW_SLIDES], 1):
+        title = ""
+        title_shape = slide.shapes.title
+        if title_shape is not None and getattr(title_shape, "has_text_frame", False):
+            title = " ".join(title_shape.text.split())
+        blocks = []
+        tables = []
+        for shape in slide.shapes:
+            if shape == title_shape:
+                continue
+            if getattr(shape, "has_text_frame", False):
+                for paragraph in shape.text_frame.paragraphs:
+                    line = " ".join(paragraph.text.split())
+                    if line:
+                        blocks.append({"level": paragraph.level or 0, "text": line})
+            if getattr(shape, "has_table", False):
+                raw_rows = [
+                    [" ".join(cell.text.split()) for cell in row.cells]
+                    for row in shape.table.rows
+                ]
+                sheet = normalize_sheet(f"Table {len(tables) + 1}", raw_rows)
+                if sheet:
+                    tables.append({"header": sheet["header"], "rows": sheet["rows"]})
+        if not title and blocks:
+            title = blocks[0]["text"]
+            blocks = blocks[1:]
+        slides.append({
+            "number": index,
+            "title": title or f"Slide {index}",
+            "blocks": blocks,
+            "tables": tables,
+        })
+    return {
+        "kind": "slides",
+        "slides": slides,
+        "total_slides": total_slides,
+        "truncated": total_slides > MAX_PREVIEW_SLIDES,
+    }
+
+
+def document_preview(request):
+    path = Path(request["path"])
+    extension = path.suffix.lower()
+    if extension in IMAGE_EXTENSIONS:
+        return {"kind": "image", "truncated": False}
+    if extension in {".xlsx", ".xls", ".csv", ".tsv"}:
+        return spreadsheet_preview(path, extension)
+    if extension == ".pptx":
+        return slides_preview(path)
+    if extension == ".json":
+        raw = read_text(path)
+        try:
+            pretty = json.dumps(json.loads(raw), ensure_ascii=False, indent=2)
+        except Exception:
+            pretty = raw
+        truncated = len(pretty) > MAX_PREVIEW_CHARS
+        return {
+            "kind": "code",
+            "language": "json",
+            "text": pretty[:MAX_PREVIEW_CHARS],
+            "truncated": truncated,
+        }
+    if extension in {".md", ".markdown"}:
+        content = read_text(path)
+        truncated = len(content) > MAX_PREVIEW_CHARS
+        return {
+            "kind": "markdown",
+            "markdown": content[:MAX_PREVIEW_CHARS],
+            "truncated": truncated,
+        }
+    if extension in TEXT_EXTENSIONS:
+        content = read_text(path)
+        truncated = len(content) > MAX_PREVIEW_CHARS
+        return {
+            "kind": "text",
+            "text": content[:MAX_PREVIEW_CHARS],
+            "truncated": truncated,
+        }
+    from markitdown import MarkItDown, StreamInfo
+
+    with path.open("rb") as file:
+        converted = MarkItDown(enable_plugins=False).convert_stream(
+            file, stream_info=StreamInfo(extension=extension)
+        )
+    content = converted.text_content or ""
+    truncated = len(content) > MAX_PREVIEW_CHARS
+    return {
+        "kind": "markdown",
+        "markdown": content[:MAX_PREVIEW_CHARS],
+        "truncated": truncated,
+    }
+
+
 class BlockRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -389,7 +615,8 @@ if __name__ == "__main__":
     try:
         job = json.load(sys.stdin.buffer)
         operations = {"parse": parse, "embed": embed, "search": search, "pdf_preview": pdf_preview,
-                      "pdf_tables": pdf_tables, "pdf_rows": pdf_rows}
+                      "pdf_tables": pdf_tables, "pdf_rows": pdf_rows, "image_preview": image_preview,
+                      "document_preview": document_preview}
         result = operations[job["action"]](job)
         if isinstance(result, bytes):
             sys.stdout.buffer.write(result)
